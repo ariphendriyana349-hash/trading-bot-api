@@ -1,7 +1,7 @@
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import numpy as np
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
@@ -250,35 +250,87 @@ def get_chart_data(symbol: str = "GC=F"):
     }
 
 # ---------------------------------------------------------
-# SIGNAL SCANNER — /api/signals
+# MASTER SYMBOL CATALOG
 # ---------------------------------------------------------
+# Format: display_pair → { ticker, category, decimals, tp_pct, sl_pct }
+#   tp_pct / sl_pct: % move for TP and SL (positive = away from entry)
+SYMBOL_CATALOG = {
+    # ── COMMODITIES ─────────────────────────────────────────
+    "XAUUSD":  {"ticker": "GC=F",       "category": "Commodities", "decimals": 2, "tp": 1.2, "sl": 0.6},
+    "XAGUSD":  {"ticker": "SI=F",       "category": "Commodities", "decimals": 3, "tp": 1.5, "sl": 0.7},
+    "XTIUSD":  {"ticker": "CL=F",       "category": "Commodities", "decimals": 2, "tp": 1.5, "sl": 0.7},
+    "XNGUSD":  {"ticker": "NG=F",       "category": "Commodities", "decimals": 3, "tp": 1.8, "sl": 0.9},
+    "XCUUSD":  {"ticker": "HG=F",       "category": "Commodities", "decimals": 4, "tp": 1.2, "sl": 0.6},
 
-# Symbol map: display pair → yfinance ticker
-SIGNAL_SYMBOLS = {
-    "XAUUSD": "GC=F",
-    "EURUSD": "EURUSD=X",
-    "GBPJPY": "GBPJPY=X",
-    "US30":   "YM=F",
-    "BTCUSD": "BTC-USD",
-    "GBPUSD": "GBPUSD=X",
+    # ── INDICES ─────────────────────────────────────────────
+    "US30":    {"ticker": "YM=F",       "category": "Indices",     "decimals": 0, "tp": 0.8, "sl": 0.4},
+    "US100":   {"ticker": "NQ=F",       "category": "Indices",     "decimals": 0, "tp": 0.8, "sl": 0.4},
+    "US500":   {"ticker": "ES=F",       "category": "Indices",     "decimals": 1, "tp": 0.8, "sl": 0.4},
+    "GER40":   {"ticker": "FDAX=F",     "category": "Indices",     "decimals": 0, "tp": 0.8, "sl": 0.4},
+    "UK100":   {"ticker": "Z=F",        "category": "Indices",     "decimals": 0, "tp": 0.8, "sl": 0.4},
+
+    # ── STOCKS ──────────────────────────────────────────────
+    "NVDA":    {"ticker": "NVDA",       "category": "Stocks",      "decimals": 2, "tp": 1.5, "sl": 0.7},
+    "TSLA":    {"ticker": "TSLA",       "category": "Stocks",      "decimals": 2, "tp": 1.8, "sl": 0.9},
+    "AAPL":    {"ticker": "AAPL",       "category": "Stocks",      "decimals": 2, "tp": 1.2, "sl": 0.6},
+    "GOOGL":   {"ticker": "GOOGL",      "category": "Stocks",      "decimals": 2, "tp": 1.2, "sl": 0.6},
+    "AMD":     {"ticker": "AMD",        "category": "Stocks",      "decimals": 2, "tp": 1.5, "sl": 0.8},
+    "INTC":    {"ticker": "INTC",       "category": "Stocks",      "decimals": 2, "tp": 1.2, "sl": 0.6},
+    "MSFT":    {"ticker": "MSFT",       "category": "Stocks",      "decimals": 2, "tp": 1.2, "sl": 0.6},
+    "AMZN":    {"ticker": "AMZN",       "category": "Stocks",      "decimals": 2, "tp": 1.2, "sl": 0.6},
+    "META":    {"ticker": "META",       "category": "Stocks",      "decimals": 2, "tp": 1.5, "sl": 0.7},
+
+    # ── CRYPTO ──────────────────────────────────────────────
+    "BTCUSD":  {"ticker": "BTC-USD",    "category": "Crypto",      "decimals": 0, "tp": 2.0, "sl": 1.0},
+    "ETHUSD":  {"ticker": "ETH-USD",    "category": "Crypto",      "decimals": 1, "tp": 2.5, "sl": 1.2},
+    "SOLUSD":  {"ticker": "SOL-USD",    "category": "Crypto",      "decimals": 2, "tp": 3.0, "sl": 1.5},
+    "BNBUSD":  {"ticker": "BNB-USD",    "category": "Crypto",      "decimals": 2, "tp": 2.0, "sl": 1.0},
+
+    # ── MAJOR FOREX ─────────────────────────────────────────
+    "EURUSD":  {"ticker": "EURUSD=X",   "category": "Forex",       "decimals": 5, "tp": 0.4, "sl": 0.2},
+    "GBPUSD":  {"ticker": "GBPUSD=X",   "category": "Forex",       "decimals": 5, "tp": 0.4, "sl": 0.2},
+    "USDJPY":  {"ticker": "JPY=X",      "category": "Forex",       "decimals": 3, "tp": 0.4, "sl": 0.2},
+    "USDCHF":  {"ticker": "CHF=X",      "category": "Forex",       "decimals": 5, "tp": 0.4, "sl": 0.2},
+    "USDCAD":  {"ticker": "CAD=X",      "category": "Forex",       "decimals": 5, "tp": 0.4, "sl": 0.2},
+    "AUDUSD":  {"ticker": "AUDUSD=X",   "category": "Forex",       "decimals": 5, "tp": 0.4, "sl": 0.2},
+    "NZDUSD":  {"ticker": "NZDUSD=X",   "category": "Forex",       "decimals": 5, "tp": 0.4, "sl": 0.2},
+
+    # ── CROSS FOREX ─────────────────────────────────────────
+    "EURGBP":  {"ticker": "EURGBP=X",   "category": "Forex",       "decimals": 5, "tp": 0.3, "sl": 0.15},
+    "EURJPY":  {"ticker": "EURJPY=X",   "category": "Forex",       "decimals": 3, "tp": 0.4, "sl": 0.2},
+    "GBPJPY":  {"ticker": "GBPJPY=X",   "category": "Forex",       "decimals": 3, "tp": 0.5, "sl": 0.25},
+    "AUDJPY":  {"ticker": "AUDJPY=X",   "category": "Forex",       "decimals": 3, "tp": 0.4, "sl": 0.2},
+    "CADJPY":  {"ticker": "CADJPY=X",   "category": "Forex",       "decimals": 3, "tp": 0.4, "sl": 0.2},
+    "CHFJPY":  {"ticker": "CHFJPY=X",   "category": "Forex",       "decimals": 3, "tp": 0.4, "sl": 0.2},
+    "EURCHF":  {"ticker": "EURCHF=X",   "category": "Forex",       "decimals": 5, "tp": 0.3, "sl": 0.15},
+    "GBPCHF":  {"ticker": "GBPCHF=X",   "category": "Forex",       "decimals": 5, "tp": 0.4, "sl": 0.2},
+    "EURAUD":  {"ticker": "EURAUD=X",   "category": "Forex",       "decimals": 5, "tp": 0.4, "sl": 0.2},
+    "EURCAD":  {"ticker": "EURCAD=X",   "category": "Forex",       "decimals": 5, "tp": 0.4, "sl": 0.2},
+    "GBPAUD":  {"ticker": "GBPAUD=X",   "category": "Forex",       "decimals": 5, "tp": 0.5, "sl": 0.25},
 }
 
-def pips_away(current_price: float, pct: float) -> float:
-    return round(current_price * (1 + pct / 100), 5)
+# Flat ticker map for backward compat (used by /api/data)
+SIGNAL_SYMBOLS = {k: v["ticker"] for k, v in SYMBOL_CATALOG.items()}
+
+def pips_away(price: float, pct: float) -> float:
+    return round(price * (1 + pct / 100), 8)
+
 
 def build_signal_from_df(pair: str, df: pd.DataFrame, sentiment: dict) -> dict | None:
     """Derive a structured signal from the last BOS event in the dataframe."""
     try:
+        meta = SYMBOL_CATALOG.get(pair, {})
+        decimals = meta.get("decimals", 5)
+        tp_pct   = meta.get("tp", 1.5)
+        sl_pct   = meta.get("sl", 0.7)
+        category = meta.get("category", "Forex")
+
+        df = df.copy()
         df['PSAR'] = calculate_psar(df)
         df = calculate_basic_smc(df)
 
-        # Find the most recent BOS signal
         last_buy_idx  = df[df['BOS_Bullish']].index.max()
         last_sell_idx = df[df['BOS_Bearish']].index.max()
-
-        # Determine which is more recent
-        direction = None
-        signal_idx = None
 
         if pd.isna(last_buy_idx) and pd.isna(last_sell_idx):
             return None
@@ -288,45 +340,33 @@ def build_signal_from_df(pair: str, df: pd.DataFrame, sentiment: dict) -> dict |
         elif pd.isna(last_sell_idx):
             direction, signal_idx = "BUY", last_buy_idx
         else:
-            if last_buy_idx > last_sell_idx:
-                direction, signal_idx = "BUY", last_buy_idx
-            else:
-                direction, signal_idx = "SELL", last_sell_idx
+            direction = "BUY" if last_buy_idx > last_sell_idx else "SELL"
+            signal_idx = last_buy_idx if direction == "BUY" else last_sell_idx
 
         row = df.loc[signal_idx]
         current_price = float(df.iloc[-1]['Close'])
         entry = float(row['Close'])
 
-        # TP = 1.5% move in signal direction, SL = 0.7% against
         if direction == "BUY":
-            tp = pips_away(entry,  1.5)
-            sl = pips_away(entry, -0.7)
+            tp = pips_away(entry,  tp_pct)
+            sl = pips_away(entry, -sl_pct)
         else:
-            tp = pips_away(entry, -1.5)
-            sl = pips_away(entry,  0.7)
+            tp = pips_away(entry, -tp_pct)
+            sl = pips_away(entry,  sl_pct)
 
-        # Confidence: recency (how many candles ago) + sentiment alignment
-        candle_age = len(df) - df.index.get_loc(signal_idx)
-        recency_score = max(0, 100 - (candle_age * 3))   # -3 per candle
+        candle_age    = len(df) - df.index.get_loc(signal_idx)
+        recency_score = max(0, 100 - (candle_age * 3))
 
         sentiment_score = sentiment.get("score", 0.0)
-        if direction == "BUY":
-            sentiment_bonus = int(sentiment_score * 30)   # up to +30 if bullish
-        else:
-            sentiment_bonus = int(-sentiment_score * 30)  # up to +30 if bearish
-
+        sentiment_bonus = int(sentiment_score * 30) if direction == "BUY" else int(-sentiment_score * 30)
         confidence = min(97, max(45, recency_score + sentiment_bonus))
-
-        # Time remaining estimate: 15-min candle = 900s window; decays with age
         time_remaining = max(120, 900 - (candle_age * 60))
 
-        # Format price to match pair type
-        decimals = 2 if pair in ("XAUUSD", "US30", "BTCUSD") else 5
         fmt = f"{{:.{decimals}f}}"
-
         return {
             "id":            f"{pair}_{int(signal_idx.timestamp())}",
             "pair":          pair,
+            "category":      category,
             "direction":     direction,
             "entry":         fmt.format(entry),
             "tp":            fmt.format(tp),
@@ -342,38 +382,65 @@ def build_signal_from_df(pair: str, df: pd.DataFrame, sentiment: dict) -> dict |
         return None
 
 
+def _scan_one(pair: str, meta: dict) -> dict | None:
+    """Worker function: download + analyse one symbol. Runs in thread pool."""
+    ticker = meta["ticker"]
+    try:
+        data = yf.download(ticker, period="5d", interval="15m",
+                           progress=False, auto_adjust=True)
+        if data.empty:
+            return None
+        df = data.copy()
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        sentiment = analyze_sentiment(ticker)
+        return build_signal_from_df(pair, df, sentiment)
+    except Exception as e:
+        print(f"Scan error {pair} ({ticker}): {e}")
+        return None
+
+
 @app.get("/api/signals")
-def get_signals():
-    """Scan all supported pairs and return active BOS signals."""
+def get_signals(category: str = ""):
+    """Parallel scan of all (or filtered) symbols. Returns active BOS signals."""
+    catalog = {
+        k: v for k, v in SYMBOL_CATALOG.items()
+        if not category or v["category"].lower() == category.lower()
+    }
+
     results = []
-    for pair, ticker in SIGNAL_SYMBOLS.items():
-        try:
-            data = yf.download(ticker, period="5d", interval="15m", progress=False)
-            if data.empty:
-                continue
+    # 10 parallel workers — keeps Railway within memory limits
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        futures = {pool.submit(_scan_one, pair, meta): pair
+                   for pair, meta in catalog.items()}
+        for future in as_completed(futures):
+            sig = future.result()
+            if sig:
+                results.append(sig)
 
-            df = data.copy()
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-
-            sentiment = analyze_sentiment(ticker)
-            signal = build_signal_from_df(pair, df, sentiment)
-
-            if signal:
-                results.append(signal)
-        except Exception as e:
-            print(f"Scan error for {pair} ({ticker}): {e}")
-
-    # Sort by confidence descending
     results.sort(key=lambda s: s["confidence"], reverse=True)
     return {"signals": results, "count": len(results)}
 
 
+@app.get("/api/symbols")
+def get_symbols():
+    """Return full symbol catalog grouped by category."""
+    grouped: dict[str, list] = {}
+    for pair, meta in SYMBOL_CATALOG.items():
+        cat = meta["category"]
+        grouped.setdefault(cat, []).append({
+            "pair":     pair,
+            "ticker":   meta["ticker"],
+            "decimals": meta["decimals"],
+        })
+    return {"categories": grouped, "total": len(SYMBOL_CATALOG)}
+
+
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "firebase": firebase_ready}
+    return {"status": "ok", "symbols": len(SYMBOL_CATALOG), "firebase": firebase_ready}
 
 
 if __name__ == "__main__":
-    print("Starting Trading Bot API on http://0.0.0.0:8000")
+    print(f"Starting Trading Bot API — {len(SYMBOL_CATALOG)} symbols loaded")
     uvicorn.run(app, host="0.0.0.0", port=8000)
